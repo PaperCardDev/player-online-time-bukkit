@@ -1,31 +1,30 @@
 package cn.paper_card.player_online_time;
 
 import cn.paper_card.database.api.DatabaseApi;
+import cn.paper_card.paper_online_time.api.PlayerOnlineTimeApi;
 import com.github.Anon8281.universalScheduler.UniversalScheduler;
 import com.github.Anon8281.universalScheduler.scheduling.schedulers.TaskScheduler;
 import com.github.Anon8281.universalScheduler.scheduling.tasks.MyScheduledTask;
+import net.kyori.adventure.text.Component;
+import net.kyori.adventure.text.TextComponent;
+import net.kyori.adventure.text.format.NamedTextColor;
+import org.bukkit.command.CommandSender;
 import org.bukkit.event.EventHandler;
 import org.bukkit.event.Listener;
 import org.bukkit.event.player.PlayerJoinEvent;
 import org.bukkit.event.player.PlayerQuitEvent;
 import org.bukkit.plugin.Plugin;
+import org.bukkit.plugin.ServicePriority;
 import org.bukkit.plugin.java.JavaPlugin;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 
-import java.sql.Connection;
 import java.sql.SQLException;
 import java.util.HashMap;
-import java.util.TimeZone;
 import java.util.UUID;
 
-public final class PlayerOnlineTime extends JavaPlugin implements PlayerOnlineTimeApi, Listener {
+public final class PlayerOnlineTime extends JavaPlugin implements Listener {
 
-
-    private DatabaseApi.MySqlConnection mySqlConnection;
-
-    private Table table = null;
-    private Connection connection = null;
 
     private final @NotNull HashMap<UUID, Long> beginTimes;
 
@@ -34,37 +33,22 @@ public final class PlayerOnlineTime extends JavaPlugin implements PlayerOnlineTi
 
     private @Nullable Plugin welcomePlugin = null;
 
+    private PlayerOnlineTimeApiImpl playerOnlineTimeApi = null;
+
     public PlayerOnlineTime() {
         this.taskScheduler = UniversalScheduler.getScheduler(this);
         this.beginTimes = new HashMap<>();
     }
 
-
-    private @NotNull Table getTable() throws SQLException {
-        final Connection rowConnection = this.mySqlConnection.getRawConnection();
-        if (this.connection == null) {
-            this.connection = rowConnection;
-            this.table = new Table(rowConnection);
-            return this.table;
-        } else if (this.connection == rowConnection) {
-            // 无变化
-            return this.table;
-        } else {
-            // 有变化
-            if (this.table != null) this.table.close();
-            this.table = new Table(rowConnection);
-            this.connection = rowConnection;
-            return this.table;
-        }
-    }
-
     private void recordAll() {
-        final long cur = System.currentTimeMillis();
 
+        // 保存每一个玩家的在线时长
         final HashMap<UUID, Long> map = new HashMap<>();
 
         synchronized (this.beginTimes) {
             for (final UUID id : this.beginTimes.keySet()) {
+                final long cur = System.currentTimeMillis();
+
                 final Long begin = this.beginTimes.get(id);
 
                 final long time = cur - begin;
@@ -74,21 +58,22 @@ public final class PlayerOnlineTime extends JavaPlugin implements PlayerOnlineTi
             }
         }
 
+        final PlayerOnlineTimeApiImpl api = this.playerOnlineTimeApi;
+        assert api != null;
+
         // 保存
-        for (UUID uuid : map.keySet()) {
+        final long cur = System.currentTimeMillis();
+        for (final UUID uuid : map.keySet()) {
             final Long time = map.get(uuid);
-            final boolean added;
-
             try {
-                added = this.addOnlineTimeToday(cur, uuid, time);
+                api.addOnlineTimeToday(uuid, cur, time);
             } catch (Exception e) {
-                this.getLogger().warning(e.toString());
-                e.printStackTrace();
-                continue;
+                getSLF4JLogger().error("", e);
             }
-
-            this.getLogger().info("%s成功，增加了玩家%s的在线时长: %dms".formatted(added ? "添加" : "更新", uuid, time));
         }
+
+        final int size = map.size();
+        if (size > 0) this.getSLF4JLogger().info("更新了%d个在线玩家的在线时长".formatted(size));
     }
 
     @Override
@@ -96,7 +81,10 @@ public final class PlayerOnlineTime extends JavaPlugin implements PlayerOnlineTi
         final DatabaseApi api = this.getServer().getServicesManager().load(DatabaseApi.class);
         if (api == null) throw new RuntimeException("无法连接到DatabaseApi");
 
-        this.mySqlConnection = api.getRemoteMySQL().getConnectionNormal();
+        this.playerOnlineTimeApi = new PlayerOnlineTimeApiImpl(api.getRemoteMySQL().getConnectionNormal());
+
+        this.getServer().getServicesManager().register(PlayerOnlineTimeApi.class, this.playerOnlineTimeApi, this, ServicePriority.Highest);
+        this.getSLF4JLogger().info("注册PlayerOnlineTimeApi...");
     }
 
     @Override
@@ -108,7 +96,6 @@ public final class PlayerOnlineTime extends JavaPlugin implements PlayerOnlineTi
         if (this.myScheduledTask == null) {
             this.myScheduledTask = this.taskScheduler.runTaskTimerAsynchronously(this::recordAll, 30 * 20, 5 * 60 * 20);
         }
-
     }
 
     @Override
@@ -118,106 +105,20 @@ public final class PlayerOnlineTime extends JavaPlugin implements PlayerOnlineTi
             this.myScheduledTask = null;
         }
 
+        this.taskScheduler.cancelTasks(this);
+
         // 保存在线时长
         this.recordAll();
 
-
-        synchronized (this.mySqlConnection) {
-            if (this.table != null) {
-                try {
-                    this.table.close();
-                } catch (SQLException e) {
-                    e.printStackTrace();
-                    this.getLogger().severe(e.toString());
-                }
-                this.table = null;
-            }
-        }
-    }
-
-    long getTodayBeginTime(long current) {
-        long delta = (current + TimeZone.getDefault().getRawOffset()) % (24 * 60 * 60 * 1000L);
-        return current - delta;
-    }
-
-    @Override
-    public @NotNull OnlineTimeAndJoinCount queryTotalOnlineAndJoinCount(@NotNull UUID uuid) throws SQLException {
-        synchronized (this.mySqlConnection) {
+        if (this.playerOnlineTimeApi != null) {
             try {
-                final Table t = this.getTable();
-                final OnlineTimeAndJoinCount i = t.queryTotal(uuid);
-                this.mySqlConnection.setLastUseTime();
-                return i;
+                this.playerOnlineTimeApi.close();
             } catch (SQLException e) {
-                try {
-                    this.mySqlConnection.handleException(e);
-                } catch (SQLException ignored) {
-                }
-                throw e;
+                this.getSLF4JLogger().error("", e);
             }
         }
     }
 
-    @Override
-    public boolean addOnlineTimeToday(long cur, @NotNull UUID player, long online) throws Exception {
-        synchronized (this.mySqlConnection) {
-            try {
-                final Table t = this.getTable();
-
-                final long begin = this.getTodayBeginTime(cur);
-
-                final int updated = t.updateTime(player, begin, online);
-                this.mySqlConnection.setLastUseTime();
-
-                if (updated == 1) return false;
-                if (updated == 0) {
-                    final int inserted = t.insert(player, begin, online, 0);
-                    this.mySqlConnection.setLastUseTime();
-                    if (inserted != 1) throw new Exception("插入了%d条数据！".formatted(inserted));
-                    return true;
-                }
-                throw new Exception("更新了%d条数据！".formatted(updated));
-
-            } catch (SQLException e) {
-                try {
-                    this.mySqlConnection.handleException(e);
-                } catch (SQLException ignored) {
-                }
-                throw e;
-            }
-        }
-    }
-
-    @Override
-    public boolean addJoinCountToday(@NotNull UUID player, long cur) throws Exception {
-        synchronized (this.mySqlConnection) {
-            try {
-                final Table t = this.getTable();
-
-                final long begin = this.getTodayBeginTime(cur);
-
-                final int updated = t.updateJoin(player, begin);
-                this.mySqlConnection.setLastUseTime();
-
-                if (updated == 1) return false;
-                if (updated == 0) {
-                    final int inserted = t.insert(player, begin, 0, 1);
-                    this.mySqlConnection.setLastUseTime();
-
-                    if (inserted != 1) throw new Exception("插入了%d条数据！".formatted(inserted));
-                    return true;
-                }
-
-                throw new Exception("更新了%d条数据！".formatted(updated));
-            } catch (SQLException e) {
-                try {
-                    this.mySqlConnection.handleException(e);
-                } catch (SQLException ignored) {
-                }
-                throw e;
-            }
-        }
-    }
 
     @EventHandler
     public void onJoin(@NotNull PlayerJoinEvent event) {
@@ -230,17 +131,27 @@ public final class PlayerOnlineTime extends JavaPlugin implements PlayerOnlineTi
         }
 
         // 进入次数加一
-        if (this.welcomePlugin == null) {
-            this.taskScheduler.runTaskAsynchronously(() -> {
-                try {
-                    final boolean added = this.addJoinCountToday(id, cur);
-                    this.getLogger().info("%s成功，将玩家%s今天的进入次数加一".formatted(added ? "添加" : "更新", event.getPlayer().getName()));
-                } catch (Exception e) {
-                    this.getLogger().warning(e.toString());
-                    e.printStackTrace();
-                }
-            });
-        }
+
+        // welcome插件会调用+1
+        if (this.welcomePlugin != null) return;
+
+        this.taskScheduler.runTaskAsynchronously(() -> {
+            final PlayerOnlineTimeApiImpl api = this.playerOnlineTimeApi;
+            assert api != null;
+
+            final boolean added;
+            try {
+                added = api.addJoinCountToday(id, cur);
+            } catch (Exception e) {
+                this.getSLF4JLogger().error("", e);
+                this.sendException(event.getPlayer(), e);
+                return;
+            }
+
+            this.getSLF4JLogger().info("%s成功，将玩家%s的进服次数加一".formatted(
+                    added ? "添加" : "更新", event.getPlayer().getName()
+            ));
+        });
     }
 
     @EventHandler
@@ -254,7 +165,7 @@ public final class PlayerOnlineTime extends JavaPlugin implements PlayerOnlineTi
         }
 
         if (beginTime == null) {
-            this.getLogger().warning("未查询到玩家%s的开始计时时间！".formatted(event.getPlayer().getName()));
+            this.getSLF4JLogger().error("未查询到玩家%s的开始计时时间！".formatted(event.getPlayer().getName()));
             return;
         }
 
@@ -266,16 +177,40 @@ public final class PlayerOnlineTime extends JavaPlugin implements PlayerOnlineTi
 
             final boolean added;
 
+            final PlayerOnlineTimeApiImpl api = this.playerOnlineTimeApi;
+            assert api != null;
+
             try {
-                added = this.addOnlineTimeToday(cur, id, time);
+                added = api.addOnlineTimeToday(id, cur, time);
             } catch (Exception e) {
-                getLogger().severe(e.toString());
-                e.printStackTrace();
+                this.getSLF4JLogger().error("", e);
                 return;
             }
 
-            this.getLogger().info("%s成功，添加在线时长：{name: %s, time: %dms}"
+            this.getSLF4JLogger().info("%s成功，添加在线时长：{name: %s, time: %dms}"
                     .formatted(added ? "添加" : "更新", event.getPlayer().getName(), time));
         });
+    }
+
+    void appendPrefix(@NotNull TextComponent.Builder text) {
+        text.append(Component.text("[").color(NamedTextColor.GRAY));
+        text.append(Component.text("在线时长").color(NamedTextColor.DARK_AQUA));
+        text.append(Component.text("]").color(NamedTextColor.GRAY));
+    }
+
+    void sendException(@NotNull CommandSender sender, @NotNull Throwable e) {
+        final TextComponent.Builder text = Component.text();
+
+        appendPrefix(text);
+        text.appendSpace();
+
+        text.append(Component.text("==== 异常信息 ====").color(NamedTextColor.DARK_RED));
+
+        for (Throwable t = e; t != null; t = t.getCause()) {
+            text.appendNewline();
+            text.append(Component.text(t.toString()).color(NamedTextColor.RED));
+        }
+
+        sender.sendMessage(text.build());
     }
 }

@@ -1,6 +1,8 @@
 package cn.paper_card.player_online_time;
 
+import cn.paper_card.database.api.Parser;
 import cn.paper_card.database.api.Util;
+import cn.paper_card.paper_online_time.api.OnlineTimeAndJoinCount;
 import org.jetbrains.annotations.NotNull;
 
 import java.sql.Connection;
@@ -9,7 +11,7 @@ import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.util.UUID;
 
-class Table {
+class Table extends Parser<OnlineTimeAndJoinCount> {
     private final static String NAME = "online_time";
 
     private final @NotNull Connection connection;
@@ -20,6 +22,8 @@ class Table {
     private PreparedStatement statementUpdateTime = null;
 
     private PreparedStatement statementQueryTotalByUuid = null;
+
+    private PreparedStatement psQueryOneDay = null;
 
     Table(@NotNull Connection connection) throws SQLException {
         this.connection = connection;
@@ -68,10 +72,22 @@ class Table {
 
     private @NotNull PreparedStatement getStatementQueryTotalByUuid() throws SQLException {
         if (this.statementQueryTotalByUuid == null) {
-            this.statementQueryTotalByUuid = this.connection.prepareStatement
-                    ("SELECT sum(time),sum(join_count) FROM %s WHERE uid1=? AND uid2=?".formatted(NAME));
+            this.statementQueryTotalByUuid = this.connection.prepareStatement("""
+                    SELECT sum(time), sum(join_count)
+                    FROM %s
+                    WHERE (uid1, uid2) = (?, ?);""".formatted(NAME));
         }
         return this.statementQueryTotalByUuid;
+    }
+
+    private @NotNull PreparedStatement getPsQueryOneDay() throws SQLException {
+        if (this.psQueryOneDay == null) {
+            this.psQueryOneDay = this.connection.prepareStatement("""
+                    SELECT sum(time), sum(join_count)
+                    FROM %s
+                    WHERE (uid1, uid2, begin) = (?, ?, ?);""".formatted(NAME));
+        }
+        return this.psQueryOneDay;
     }
 
     int insert(@NotNull UUID uuid, long begin, long time, long join) throws SQLException {
@@ -101,7 +117,16 @@ class Table {
         return ps.executeUpdate();
     }
 
-    @NotNull PlayerOnlineTimeApi.OnlineTimeAndJoinCount queryTotal(@NotNull UUID uuid) throws SQLException {
+    @NotNull OnlineTimeAndJoinCount queryOneDay(@NotNull UUID uuid, long begin) throws SQLException {
+        final PreparedStatement ps = this.getPsQueryOneDay();
+        ps.setLong(1, uuid.getMostSignificantBits());
+        ps.setLong(2, uuid.getLeastSignificantBits());
+        ps.setLong(3, begin);
+        final ResultSet resultSet = ps.executeQuery();
+        return this.parseOnlyOne(resultSet);
+    }
+
+    @NotNull OnlineTimeAndJoinCount queryTotal(@NotNull UUID uuid) throws SQLException {
         final PreparedStatement ps = this.getStatementQueryTotalByUuid();
 
         ps.setLong(1, uuid.getMostSignificantBits());
@@ -109,27 +134,13 @@ class Table {
 
         final ResultSet resultSet = ps.executeQuery();
 
-        final PlayerOnlineTimeApi.OnlineTimeAndJoinCount info;
-        try {
+        return this.parseOnlyOne(resultSet);
+    }
 
-            if (resultSet.next()) {
-                final long totalTime = resultSet.getLong(1);
-                final long totalCount = resultSet.getLong(2);
-                info = new PlayerOnlineTimeApi.OnlineTimeAndJoinCount(totalTime, totalCount);
-            } else throw new SQLException("不应该没有数据！");
-
-            if (resultSet.next()) throw new SQLException("不应该还有数据！");
-
-        } catch (SQLException e) {
-            try {
-                resultSet.close();
-            } catch (SQLException ignored) {
-            }
-            throw e;
-        }
-
-        resultSet.close();
-
-        return info;
+    @Override
+    public @NotNull OnlineTimeAndJoinCount parseRow(@NotNull ResultSet resultSet) throws SQLException {
+        final long time = resultSet.getLong(1);
+        final long count = resultSet.getLong(2);
+        return new OnlineTimeAndJoinCount(time, count);
     }
 }
